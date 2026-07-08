@@ -1,6 +1,6 @@
 # 🚩 Fluid Attacks CTF 2026 V2 — UnRestricted Mode
 
-**19/22 challenges solved | 1995 points**
+**19/22 challenges solved**
 
 This repository contains my writeups for the challenges I solved during the **Fluid Attacks CTF 2026 V2**. Each writeup documents the methodology, vulnerability analysis, exploitation process, and key lessons learned throughout the competition.
 
