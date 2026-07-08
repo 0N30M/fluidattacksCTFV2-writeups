@@ -268,7 +268,7 @@ import urllib.error
 # EDIT THESE 2 LINES BEFORE USING IT
 # ==========================================================
 
-HOST = "https://9483f940239b8f2a.chal.ctf.ae"
+HOST = "https://INSTANCE.chal.ctf.ae"
 TARGET_FILE = "private/flag.txt"
 
 # ==========================================================
@@ -531,7 +531,7 @@ For the Crumble Cookie instance, the server returned:
 
 ```json
 {
-  "content": "flag{bedfafcfca914200}",
+  "content": "flag{................}",
   "filename": "private/flag.txt"
 }
 ```
