@@ -1,8 +1,7 @@
-# YAML Ain't Safe
+# Challenge - YAML Ain't Safe
 
 > **Category:** Web  
 > **Difficulty:** Easy  
-> **Event:** FluidSec CTF
 
 ## Description
 
