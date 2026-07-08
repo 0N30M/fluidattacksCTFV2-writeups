@@ -160,7 +160,7 @@ The server returned the flag.
 ```bash
 #!/bin/bash
 
-BASE='https://YOUR_INSTANCE.chal.ctf.ae'
+BASE='https://INSTANCE.chal.ctf.ae'
 J='cookies.txt'
 
 rm -f "$J"
