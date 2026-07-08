@@ -1,10 +1,7 @@
-# Crumble Cookie — SHA-256 Length Extension Attack
+# Challenge - Crumble Cookie 
 
-- Challenge: Crumble Cookie  
 - Category: Cryptography  
 - Difficulty: Easy  
-- Target: `https://9483f940239b8f2a.chal.ctf.ae`  
-- Flag: `flag{bedfafcfca914200}`  
 
 This writeup explains how I solved **Crumble Cookie** by abusing a SHA-256 length extension vulnerability in the file download token mechanism, using a custom Python exploit script.
 
