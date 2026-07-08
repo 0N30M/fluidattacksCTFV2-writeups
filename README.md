@@ -43,7 +43,7 @@ Each writeup includes:
 - Technical analysis
 - Vulnerability explanation
 - Exploitation methodology
-- Python proof-of-concept (when applicable)
+- Bash or Python proof-of-concept (when applicable)
 - Lessons learned
 
 These writeups are intended to document my learning process and showcase practical Application Security, Cryptography, and Offensive Security techniques.
