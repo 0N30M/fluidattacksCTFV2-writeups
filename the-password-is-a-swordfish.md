@@ -260,10 +260,33 @@ Read /flag.txt
 
 ---
 
+# Remediation
+
+The root cause of this vulnerability is the inconsistent handling of signed and unsigned integers during input validation. Although the application limits the password length to 64 characters, supplying a negative value bypasses the signed comparison and later becomes a very large unsigned integer, allowing the input loop to overflow the stack.
+
+The issue can be mitigated by applying the following secure coding practices:
+
+- Reject negative values immediately after reading user input.
+- Use unsigned integer types consistently when handling buffer sizes and lengths.
+- Ensure the same comparison semantics are used throughout the program (avoid mixing signed and unsigned comparisons).
+- Replace manual character-by-character input loops with safer functions that enforce buffer limits.
+- Validate that the number of bytes read never exceeds the destination buffer size.
+- Compile binaries with modern security protections such as **Stack Canaries**, **PIE**, **Full RELRO**, and **FORTIFY_SOURCE** to make exploitation significantly more difficult.
+
+Example of safer validation:
+
+```c
+if (password_length < 0 || password_length > 64) {
+    puts("Invalid password length.");
+    exit(EXIT_FAILURE);
+}
+```
+
+By validating the input before it is used and applying consistent integer handling, the stack overflow can be completely prevented.
+
 # Lessons Learned
 
 This challenge highlights how inconsistent handling of signed and unsigned integers can completely bypass input validation and lead to memory corruption. It also demonstrates that understanding the exact stack layout is essential when building reliable exploits, especially when local variables such as loop counters are overwritten during the overflow.
 
 ---
 
----
