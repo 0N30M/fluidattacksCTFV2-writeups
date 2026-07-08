@@ -286,7 +286,13 @@ By validating the input before it is used and applying consistent integer handli
 
 # Lessons Learned
 
-This challenge highlights how inconsistent handling of signed and unsigned integers can completely bypass input validation and lead to memory corruption. It also demonstrates that understanding the exact stack layout is essential when building reliable exploits, especially when local variables such as loop counters are overwritten during the overflow.
+This challenge demonstrates how seemingly small implementation details can introduce critical security vulnerabilities. The root cause was not the absence of bounds checking alone, but an inconsistency in how the program interpreted the same value during different stages of execution. A signed comparison accepted a negative input, while an unsigned comparison later interpreted that value as an extremely large positive integer, ultimately enabling a stack-based buffer overflow.
+
+Another important takeaway is the need to fully understand the memory layout of a vulnerable function before developing an exploit. During the analysis, the loop counter was found to reside within the overflowed stack frame. Overwriting it with arbitrary padding caused the exploit to fail before reaching the saved return address. Preserving the expected counter value at the correct offset allowed the overflow to continue reliably, illustrating how seemingly insignificant local variables can directly influence exploit stability.
+
+The challenge also reinforces that modern exploit mitigations should be evaluated together rather than individually. Although the binary had **NX** enabled, the absence of **PIE** and the lack of a stack canary in the vulnerable function made a classic **ret2win** attack sufficient. Instead of injecting shellcode, the exploit redirected execution to an existing function already present in the binary, demonstrating that control-flow hijacking remains effective when code addresses are predictable.
+
+Finally, this exercise highlights that static linking alone does not improve resistance against memory corruption vulnerabilities. While the binary contained all required libraries internally, the vulnerable logic remained exploitable because the target function was located at a fixed address. Secure software depends primarily on correct input validation, consistent integer handling, proper bounds checking, and compiler protections rather than on the linking method itself.
 
 ---
 
