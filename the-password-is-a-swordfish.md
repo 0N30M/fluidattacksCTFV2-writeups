@@ -1,9 +1,7 @@
 # The Password is Swordfish
 
 > **Category:** Binary Exploitation (Pwn)  
-> **Difficulty:** Medium  
-> **Event:** Fluid Attacks CTF  
-> **Author:** Engels Almanzar
+> **Difficulty:** Easy  
 
 ## Description
 
