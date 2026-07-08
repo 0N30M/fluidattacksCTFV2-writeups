@@ -284,6 +284,8 @@ if (password_length < 0 || password_length > 64) {
 
 By validating the input before it is used and applying consistent integer handling, the stack overflow can be completely prevented.
 
+---
+
 # Lessons Learned
 
 This challenge demonstrates how seemingly small implementation details can introduce critical security vulnerabilities. The root cause was not the absence of bounds checking alone, but an inconsistency in how the program interpreted the same value during different stages of execution. A signed comparison accepted a negative input, while an unsigned comparison later interpreted that value as an extremely large positive integer, ultimately enabling a stack-based buffer overflow.
