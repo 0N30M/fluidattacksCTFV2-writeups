@@ -118,7 +118,7 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-HOST = sys.argv.rstrip("/") if len(sys.argv) > 1 else "https://09292adac643a29d.chal.ctf.ae"[1]
+HOST = sys.argv.rstrip("/") if len(sys.argv) > 1 else "https://INSTANCE.chal.ctf.ae"[1]
 
 s = requests.Session()
 s.verify = False
