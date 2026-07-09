@@ -1,6 +1,5 @@
 # Challenge - Ni8mare Lite 
 
-- Name: Ni8mare Lite  
 - Category: API  
 - Difficulty: Hard  
 
